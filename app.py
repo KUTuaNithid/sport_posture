@@ -17,6 +17,8 @@ min_confidence = st.slider("Minimum Keypoint Confidence", min_value=0.0, max_val
 
 if uploaded_file is not None:
     st.video(uploaded_file)
+    is_treadmill = st.checkbox("Running on a Treadmill? (Changes foot strike physics)")
+    running_direction = st.radio("Runner Direction (Important for treadmill videos)", ["Left to Right", "Right to Left"])
     if st.button("Analyze Posture"):
         with st.spinner("Analyzing video... This might take a minute."):
             # Save uploaded video to temp file
@@ -26,32 +28,74 @@ if uploaded_file is not None:
             tfile.close()
             
             # Analyze
-            result = analyze_video(temp_input_path, model_choice, use_intel_gpu, show_keypoint_numbers, show_keypoint_confidence, min_confidence)
+            result = analyze_video(temp_input_path, model_choice, use_intel_gpu, show_keypoint_numbers, show_keypoint_confidence, min_confidence, running_direction, is_treadmill)
             
             st.success("Analysis Complete!")
             
-            # Display images sequentially 
-            if result.get('debug_image_paths'):
-                st.subheader("Frames Used for Averaging")
-                cols = st.columns(len(result['debug_image_paths']))
-                for idx, img_path in enumerate(result['debug_image_paths']):
-                    with cols[idx]:
-                        st.image(img_path, caption=f"Window Frame {idx+1}")
+            # Display debug location info
+            if result.get('debug_run_dir'):
+                abs_path = os.path.abspath(result['debug_run_dir'])
+                st.info(f"📁 **Detailed frame-by-frame debug images saved to:** `{abs_path}`\n\nInside you will find `left_tracking` and `right_tracking` folders containing analysis for every single frame.")
+                            
+            # --- Per-Step Metrics Data Preparation ---
+            step_metrics = result.get('step_metrics', [])
+            left_steps = [s for s in step_metrics if s['leg'] == 'Left']
+            right_steps = [s for s in step_metrics if s['leg'] == 'Right']
+            
+            def safe_mean(metrics_list, key):
+                return sum(s[key] for s in metrics_list) / len(metrics_list) if metrics_list else 0.0
+                
+            l_lean = safe_mean(left_steps, 'torso_lean')
+            r_lean = safe_mean(right_steps, 'torso_lean')
+            l_knee = safe_mean(left_steps, 'knee_flexion')
+            r_knee = safe_mean(right_steps, 'knee_flexion')
+            l_over = safe_mean(left_steps, 'overstride_ratio')
+            r_over = safe_mean(right_steps, 'overstride_ratio')
             
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.subheader("Debug Video")
                 st.video(result['output_video_path'])
+                
+                if step_metrics:
+                    st.subheader("Averages by Leg (Symmetry)")
+                    leg_col1, leg_col2 = st.columns(2)
+                    with leg_col1:
+                        st.markdown("**Left Leg Averages**")
+                        st.metric("Torso Lean", f"{l_lean:.1f}°")
+                        st.metric("Knee Flexion", f"{l_knee:.1f}°")
+                        st.metric("Overstride Ratio", f"{l_over*100:.1f}%")
+                    with leg_col2:
+                        st.markdown("**Right Leg Averages**")
+                        st.metric("Torso Lean", f"{r_lean:.1f}°")
+                        st.metric("Knee Flexion", f"{r_knee:.1f}°")
+                        st.metric("Overstride Ratio", f"{r_over*100:.1f}%")
+                        
+                    st.subheader("Consistency Over Time (Per Step)")
+                    import pandas as pd
+                    df = pd.DataFrame(step_metrics)
+                    df['Step Number'] = df['step_number']
+                    df.set_index('Step Number', inplace=True)
+                    
+                    st.markdown("**Torso Lean consistency**")
+                    st.line_chart(df[['torso_lean']])
+                    
+                    st.markdown("**Knee Flexion consistency**")
+                    st.line_chart(df[['knee_flexion']])
+                    
+                    st.markdown("**Overstride Ratio % consistency**")
+                    df['overstride_percentage'] = df['overstride_ratio'] * 100
+                    st.line_chart(df[['overstride_percentage']])
             
             with col2:
-                st.subheader("Metrics at Foot Strike")
+                st.subheader("Overall Run Averages")
                 st.metric("Torso Lean", f"{result['torso_lean']:.1f}°")
                 st.metric("Knee Flexion", f"{result['knee_flexion']:.1f}°")
                 st.metric("Overstride Ratio", f"{result['overstride_ratio']*100:.1f}% of Leg Length")
                 
                 st.subheader("Feedback")
                 if result['is_overstriding']:
-                    st.warning("⚠️ **Overstriding Detected!** Your foot is landing too far in front of your body's center of mass.")
+                    st.warning("⚠️ **Overstriding Detected!** On average, your foot is landing too far in front of your body's center of mass.")
                     st.write("💡 *Actionable Advice*: Try to increase your cadence (steps per minute). A higher cadence naturally shortens stride length and brings your foot strike safely back under your hips.")
                 else:
                     st.success("✅ **Good Stride Length!** Your foot is landing nicely under your center of mass.")
