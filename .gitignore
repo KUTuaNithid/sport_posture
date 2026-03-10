@@ -1,0 +1,23 @@
+# Environments
+venv/
+venv311/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# AI Models (Avoid committing large weight files)
+*.pt
+*_openvino_model/
+
+# Videos and Images (Avoid committing large media files)
+*.mp4
+*.mov
+*.avi
+debug_images/
+
+# OS Files
+.DS_Store
+Thumbs.db
