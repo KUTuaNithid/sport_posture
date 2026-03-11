@@ -5,3 +5,5 @@ moviepy
 openvino
 numpy
 scipy
+streamlit-drawable-canvas
+plotly

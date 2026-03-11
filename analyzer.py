@@ -38,6 +38,192 @@ def calculate_angle(A, B, C):
     return np.degrees(angle_rad)
 
 @st.cache_data(show_spinner=False)
+def get_video_info(video_path):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0 or math.isnan(fps):
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return total_frames, fps, width, height
+
+def get_frame(video_path, frame_idx):
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    cap.release()
+    if ret:
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return None
+
+def get_frame_thumbnails(video_path, frame_indices):
+    cap = cv2.VideoCapture(video_path)
+    thumbnails = []
+    # Sort indices to only read video forward
+    sorted_indices = sorted(frame_indices)
+    idx_map = {}
+    
+    current_idx = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    while cap.isOpened() and current_idx <= sorted_indices[-1]:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if current_idx in sorted_indices:
+            # Keep resolution high enough for zooming
+            h, w = frame.shape[:2]
+            thumb_h = min(h, 720)
+            thumb_w = int(w * (thumb_h / h))
+            if thumb_h < h:
+                thumb = cv2.resize(frame, (thumb_w, thumb_h))
+            else:
+                thumb = frame
+            idx_map[current_idx] = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+        current_idx += 1
+    cap.release()
+    
+    # Return in original requested order
+    for idx in frame_indices:
+        thumbnails.append(idx_map.get(idx, None))
+    return thumbnails
+
+# COCO Keypoint IDs
+NOSE = 0
+L_SHOULDER, R_SHOULDER = 5, 6
+L_HIP, R_HIP = 11, 12
+L_KNEE, R_KNEE = 13, 14
+L_ANKLE, R_ANKLE = 15, 16
+SKELETON_CONNECTIONS = [(0,1), (0,2), (1,3), (2,4), (5,6), (5,7), (7,9), (6,8), (8,10), (5,11), (6,12), (11,12), (11,13), (13,15), (12,14), (14,16)]
+
+def compute_single_frame_metrics(frame, model, min_confidence=0.5, running_direction="Left to Right"):
+    # Inference
+    results = model(frame, verbose=False)
+    keypoints = None
+    if len(results) > 0 and len(results[0].keypoints) > 0:
+        kpts_xy = results[0].keypoints.xy.cpu().numpy()[0]
+        kpts_conf = results[0].keypoints.conf.cpu().numpy()[0]
+        
+        keypoints = []
+        for (x, y), conf in zip(kpts_xy, kpts_conf):
+            if conf >= min_confidence:
+                keypoints.append([x, y, conf])
+            else:
+                keypoints.append([0.0, 0.0, 0.0])
+        keypoints = np.array(keypoints)
+        
+    metrics = {'Left': {}, 'Right': {}, 'keypoints': keypoints}
+    running_left_to_right = (running_direction == "Left to Right")
+    
+    if keypoints is not None and len(keypoints) >= 17:
+        for side, idxs in [('Left', (L_HIP, L_KNEE, L_ANKLE, L_SHOULDER)), 
+                           ('Right', (R_HIP, R_KNEE, R_ANKLE, R_SHOULDER))]:
+            hip = keypoints[idxs[0]]
+            knee = keypoints[idxs[1]]
+            ankle = keypoints[idxs[2]]
+            shoulder = keypoints[idxs[3]]
+            
+            if hip[0] > 0 and knee[0] > 0 and ankle[0] > 0 and shoulder[0] > 0:
+                l_shoulder, r_shoulder = keypoints[L_SHOULDER], keypoints[R_SHOULDER]
+                l_hip, r_hip = keypoints[L_HIP], keypoints[R_HIP]
+                
+                if l_shoulder[0] > 0 and r_shoulder[0] > 0 and l_hip[0] > 0 and r_hip[0] > 0:
+                    virtual_shoulder = [(l_shoulder[0] + r_shoulder[0]) / 2.0, (l_shoulder[1] + r_shoulder[1]) / 2.0]
+                    virtual_hip = [(l_hip[0] + r_hip[0]) / 2.0, (l_hip[1] + r_hip[1]) / 2.0]
+                else:
+                    virtual_shoulder = shoulder
+                    virtual_hip = hip
+                
+                vertical_point = [virtual_hip[0], virtual_hip[1] - 100]
+                lean_angle = calculate_angle(virtual_shoulder, virtual_hip, vertical_point)
+                is_leaning_forward = (virtual_shoulder[0] > virtual_hip[0]) if running_left_to_right else (virtual_shoulder[0] < virtual_hip[0])
+                torso_lean = lean_angle if is_leaning_forward else -lean_angle
+                
+                knee_flexion = 180.0 - calculate_angle(hip, knee, ankle)
+                overstride_distance = abs(ankle[0] - hip[0])
+                
+                leg_length = np.linalg.norm(np.array([hip[0] - knee[0], hip[1] - knee[1]])) + \
+                             np.linalg.norm(np.array([knee[0] - ankle[0], knee[1] - ankle[1]]))
+                overstride_ratio = overstride_distance / leg_length if leg_length > 0 else 0
+                
+                metrics[side] = {
+                    'valid': True, 'torso_lean': torso_lean, 'knee_flexion': knee_flexion,
+                    'overstride_distance': overstride_distance, 'overstride_ratio': overstride_ratio,
+                    'hip': hip, 'knee': knee, 'ankle': ankle, 'shoulder': shoulder,
+                    'virtual_hip': virtual_hip, 'virtual_shoulder': virtual_shoulder
+                }
+    return metrics
+
+def annotate_frame(frame_rgb, metrics, side='Left', show_skeleton=True, show_metrics=True, show_keypoint_numbers=False, show_keypoint_confidence=False):
+    annotated = frame_rgb.copy()
+    kpts = metrics.get('keypoints')
+    
+    if show_skeleton and kpts is not None:
+        for conn in SKELETON_CONNECTIONS:
+            if len(kpts) > max(conn):
+                pt1 = (int(kpts[conn[0]][0]), int(kpts[conn[0]][1]))
+                pt2 = (int(kpts[conn[1]][0]), int(kpts[conn[1]][1]))
+                if pt1[0] > 0 and pt1[1] > 0 and pt2[0] > 0 and pt2[1] > 0:
+                    cv2.line(annotated, pt1, pt2, (255, 255, 0), 2)
+        
+        for pt_idx, pt in enumerate(kpts):
+            x, y = int(pt[0]), int(pt[1])
+            conf = float(pt[2]) if len(pt) > 2 else 0.0
+            if x > 0 and y > 0:
+                text_offset = -10
+                if show_keypoint_numbers:
+                    cv2.putText(annotated, str(pt_idx), (x, y + text_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    text_offset -= 15
+                if show_keypoint_confidence:
+                    cv2.putText(annotated, f"{conf:.2f}", (x, y + text_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                if not show_keypoint_numbers:
+                    cv2.circle(annotated, (x, y), 5, (0, 255, 0), -1)
+
+    if show_metrics:
+        m = metrics.get(side, {})
+        if m.get('valid', False):
+            hip_pt = (int(m['hip'][0]), int(m['hip'][1]))
+            knee_pt = (int(m['knee'][0]), int(m['knee'][1]))
+            ankle_pt = (int(m['ankle'][0]), int(m['ankle'][1]))
+            v_hip = (int(m['virtual_hip'][0]), int(m['virtual_hip'][1]))
+            v_shoulder = (int(m['virtual_shoulder'][0]), int(m['virtual_shoulder'][1]))
+            
+            # Torso Lean
+            vertical_top = (v_hip[0], v_hip[1] - 150)
+            cv2.line(annotated, v_hip, vertical_top, (0, 255, 255), 2, cv2.LINE_AA) 
+            cv2.line(annotated, v_hip, v_shoulder, (255, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(annotated, f"Lean: {m['torso_lean']:.1f} deg", (v_hip[0] + 20, v_hip[1] - 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        
+            # Knee Flexion
+            cv2.line(annotated, hip_pt, knee_pt, (255, 0, 0), 3, cv2.LINE_AA)
+            cv2.line(annotated, knee_pt, ankle_pt, (255, 0, 0), 3, cv2.LINE_AA)
+            dx_thigh = knee_pt[0] - hip_pt[0]
+            dy_thigh = knee_pt[1] - hip_pt[1]
+            len_thigh = math.hypot(dx_thigh, dy_thigh)
+            len_shin = math.hypot(ankle_pt[0] - knee_pt[0], ankle_pt[1] - knee_pt[1])
+            if len_thigh > 0:
+                ext_x = int(knee_pt[0] + (dx_thigh / len_thigh) * len_shin)
+                ext_y = int(knee_pt[1] + (dy_thigh / len_thigh) * len_shin)
+                cv2.line(annotated, knee_pt, (ext_x, ext_y), (0, 165, 255), 2, cv2.LINE_AA)
+            cv2.putText(annotated, f"Knee: {m['knee_flexion']:.1f} deg", (knee_pt[0] + 20, knee_pt[1]), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                        
+            # Overstride
+            floor_y = ankle_pt[1]
+            hip_proj = (hip_pt[0], floor_y)
+            cv2.line(annotated, hip_pt, hip_proj, (0, 255, 255), 2, cv2.LINE_AA)
+            is_frame_overstride = m['overstride_ratio'] > 0.08
+            cv2.line(annotated, hip_proj, ankle_pt, (255, 0, 0) if is_frame_overstride else (0, 255, 0), 3, cv2.LINE_AA) # Red is BGR so RGB would be (255,0,0) wait cv2 functions use the array format. Actually, in Streamlit we are manipulating an RGB array. So (255, 0, 0) is Red, (0, 255, 0) is Green, (0, 0, 255) is Blue.
+            color_overstride = (255, 0, 0) if is_frame_overstride else (0, 255, 0)
+            cv2.line(annotated, hip_proj, ankle_pt, color_overstride, 3, cv2.LINE_AA)
+            cv2.putText(annotated, f"Overstride: {m['overstride_ratio']*100:.1f}% leg", (hip_proj[0], floor_y + 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_overstride, 2)
+                        
+    return annotated
+
+@st.cache_data(show_spinner=False)
 def analyze_video(video_path, model_name='yolov8n-pose.pt', use_intel_gpu=False, show_keypoint_numbers=False, show_keypoint_confidence=False, min_confidence=0.5, running_direction="Left to Right", is_treadmill=False):
     model = load_pose_model(model_name, use_intel_gpu)
     
